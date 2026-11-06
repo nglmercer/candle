@@ -950,6 +950,17 @@ impl VulkanDevice {
     }
 
     fn alloc_raw(&self, capacity: u64) -> Result<(vk::Buffer, Alloc, *mut u8)> {
+        let t = kernels::profile_enabled().then(std::time::Instant::now);
+        let r = self.alloc_raw_inner(capacity);
+        if let Some(t) = t {
+            use std::sync::atomic::Ordering::Relaxed;
+            kernels::HOST_ALLOC_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            kernels::HOST_ALLOCS.fetch_add(1, Relaxed);
+        }
+        r
+    }
+
+    fn alloc_raw_inner(&self, capacity: u64) -> Result<(vk::Buffer, Alloc, *mut u8)> {
         let dev = &self.inner.device;
         let buffer = unsafe {
             dev.create_buffer(

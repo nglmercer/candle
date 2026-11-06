@@ -73,6 +73,28 @@ pub(crate) fn note_submit(wait: std::time::Duration) {
     SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     WAIT_NS.fetch_add(wait.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 }
+pub(crate) static HOST_ALLOC_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static HOST_DESC_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static HOST_LAUNCH_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static HOST_GAP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static HOST_FIRSTSEG_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static LAST_SYNC: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+pub(crate) static HOST_ALLOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Host-side cost breakdown (profiling mode): (allocs, alloc ns, descriptor ns, total launch ns).
+pub fn host_profile() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        HOST_ALLOCS.load(Relaxed),
+        HOST_ALLOC_NS.load(Relaxed),
+        HOST_DESC_NS.load(Relaxed),
+        HOST_LAUNCH_NS.load(Relaxed),
+    )
+}
+
 pub(crate) fn note_dequantize(dtype: crate::quantized::GgmlDType, elem_count: usize) {
     DEQUANTIZE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if trace_enabled() {
@@ -118,6 +140,24 @@ impl std::fmt::Display for VulkanStats {
             self.gpu_wait_ns as f64 / 1e6,
             self.dequantizations,
         )?;
+        let (na, an, dn, ln) = host_profile();
+        if ln > 0 {
+            use std::sync::atomic::Ordering::Relaxed;
+            write!(
+                f,
+                "\n  host gap after syncs {:.1} ms, first-segment recording {:.1} ms",
+                HOST_GAP_NS.load(Relaxed) as f64 / 1e6,
+                HOST_FIRSTSEG_NS.load(Relaxed) as f64 / 1e6
+            )?;
+            write!(
+                f,
+                "\n  host: {na} buffer allocs {:.1} ms ({:.2} us each), descriptor sets {:.1} ms, launch total {:.1} ms",
+                an as f64 / 1e6,
+                an as f64 / 1e3 / na.max(1) as f64,
+                dn as f64 / 1e6,
+                ln as f64 / 1e6
+            )?;
+        }
         let prof = kernel_profile();
         if !prof.is_empty() {
             let total: u64 = prof.iter().map(|p| p.2).sum();
@@ -209,6 +249,16 @@ pub fn reset_stats() {
     DEQUANTIZE.store(0, Relaxed);
     *FALLBACK_OPS.lock().unwrap_or_else(|p| p.into_inner()) = None;
     *PROFILE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    for c in [
+        &HOST_ALLOC_NS,
+        &HOST_DESC_NS,
+        &HOST_LAUNCH_NS,
+        &HOST_ALLOCS,
+        &HOST_GAP_NS,
+        &HOST_FIRSTSEG_NS,
+    ] {
+        c.store(0, Relaxed);
+    }
 }
 
 /// Record (and, under `CANDLE_VULKAN_TRACE`, log) an op that fell back to
@@ -671,6 +721,7 @@ pub struct Exec {
     /// Buffers written / read since the last barrier (tracked mode).
     written: std::collections::HashSet<vk::Buffer>,
     read: std::collections::HashSet<vk::Buffer>,
+    batch_start: Option<std::time::Instant>,
 }
 
 unsafe impl Send for Exec {}
@@ -787,6 +838,7 @@ impl Exec {
             seg_launches: 0,
             written: std::collections::HashSet::new(),
             read: std::collections::HashSet::new(),
+            batch_start: None,
             garbage: Vec::new(),
         })
     }
@@ -806,6 +858,16 @@ impl Exec {
                         .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                 )
                 .map_err(|e| Error::Msg(format!("vulkan begin_command_buffer failed: {e:?}")))?;
+        }
+        if profile_enabled() {
+            let now = std::time::Instant::now();
+            if let Some(t) = *LAST_SYNC.lock().unwrap_or_else(|p| p.into_inner()) {
+                HOST_GAP_NS.fetch_add(
+                    (now - t).as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            self.batch_start = Some(now);
         }
         self.recording = true;
         self.launches = 0;
@@ -880,6 +942,10 @@ impl Exec {
                     .wait_for_fences(&fences, true, u64::MAX)
                     .map_err(|e| Error::Msg(format!("vulkan wait_for_fences failed: {e:?}")))?;
                 note_submit(t0.elapsed());
+                if profile_enabled() {
+                    *LAST_SYNC.lock().unwrap_or_else(|p| p.into_inner()) =
+                        Some(std::time::Instant::now());
+                }
                 if let Some(prof) = self.prof.as_mut() {
                     let n = prof.keys.len();
                     if n > 0 {
@@ -926,6 +992,12 @@ impl Exec {
     /// Submits the commands recorded so far without waiting, and continues
     /// recording in a fresh command buffer.
     fn submit_segment(&mut self) -> Result<()> {
+        if let Some(t) = self.batch_start.take() {
+            HOST_FIRSTSEG_NS.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         unsafe {
             self.device
                 .end_command_buffer(self.cmd)
@@ -994,6 +1066,7 @@ impl Exec {
         };
         self.params_off += PARAM_SLOT;
         // Descriptor set.
+        let t_desc = profile_enabled().then(std::time::Instant::now);
         let set_layouts = [pipe.dsl];
         let set = unsafe {
             dev.allocate_descriptor_sets(
@@ -1029,6 +1102,12 @@ impl Exec {
             .collect();
         unsafe {
             dev.update_descriptor_sets(&writes, &[]);
+            if let Some(t) = t_desc {
+                HOST_DESC_NS.fetch_add(
+                    t.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
             dev.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipe.pipeline);
             dev.cmd_bind_descriptor_sets(
                 self.cmd,
@@ -1311,10 +1390,17 @@ impl VulkanDevice {
         let nbuf = bufs.len() as u32;
         let pipe = self.pipeline(key, nbuf, src)?;
         let mut exec = self.exec();
+        let t_launch = profile_enabled().then(std::time::Instant::now);
         if profile_enabled() {
             exec.prof_key = key.to_string();
         }
         let full = exec.record(&pipe, bufs, &push.0, params, groups)?;
+        if let Some(t) = t_launch {
+            HOST_LAUNCH_NS.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         if full {
             let garbage = exec.flush()?;
             self.free_garbage(garbage);
