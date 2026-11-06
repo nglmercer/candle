@@ -18,6 +18,7 @@
 
 pub mod glsl;
 pub mod kernels;
+pub mod kq;
 pub mod wgsl;
 pub use kernels::{
     fallback_count, native_enabled, native_exec_count, reset_stats, stats, VulkanStats,
@@ -2446,6 +2447,12 @@ impl QVulkanStorage {
                 dev.exec().batch_limit = kernels::PREFILL_MAX_LAUNCHES;
             }
             kernels::run_qgemv_f64(dev, self.dtype, storage.buf(), w, out.buf(), m, n, k, o1, 1)?;
+            return Ok((out, dst_shape));
+        }
+        if kq::supports(self.dtype, k)
+            && (m <= QGEMV_MAX_ROWS || std::env::var("CANDLE_VULKAN_KQ_MM").is_ok_and(|v| v == "1"))
+        {
+            kq::run(dev, self.dtype, storage.buf(), w, out.buf(), m, n, k, o1)?;
             return Ok((out, dst_shape));
         }
         match self.dtype {

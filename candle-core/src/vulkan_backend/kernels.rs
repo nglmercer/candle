@@ -2310,6 +2310,9 @@ pub fn run_qgemv_with(
     k: usize,
     xoff: usize,
 ) -> Result<()> {
+    if super::kq::supports(dtype, k) {
+        return super::kq::run(d, dtype, x, w, out, m, n, k, xoff);
+    }
     let lim = d.limits();
     let cubecl = match dtype {
         crate::quantized::GgmlDType::Q4K => Some((
