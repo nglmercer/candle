@@ -2598,7 +2598,7 @@ pub fn run_qgemv_f64(
         .us(k)?
         .i(qtype_code(dtype))
         .us(dtype.block_size())?
-        .us(dtype.type_size())?
+        .us(super::dev_type_size(dtype))?
         .us(off)?
         .i(0)
         .us(m)?;
@@ -2732,7 +2732,7 @@ pub fn run_qgemv_with(
             include_str!("q2k_cubecl.wgsl"),
             true,
         )),
-        crate::quantized::GgmlDType::Q6K => Some((
+        crate::quantized::GgmlDType::Q6K if !super::q6k_padded() => Some((
             256,
             210,
             "q6k_cubecl_256",
@@ -2785,7 +2785,7 @@ pub fn run_qgemv_with(
         .us(k)?
         .i(qtype_code(dtype))
         .us(dtype.block_size())?
-        .us(dtype.type_size())?
+        .us(super::dev_type_size(dtype))?
         .us(xoff)?
         .i(0)
         .us(m)?;
@@ -2839,7 +2839,7 @@ pub fn run_qgemv_with(
                 .us(k)?
                 .i(qtype_code(dtype))
                 .us(dtype.block_size())?
-                .us(dtype.type_size())?
+                .us(super::dev_type_size(dtype))?
                 .i(0)
                 .us(m)?;
             let groups = row_grid(
@@ -3058,7 +3058,7 @@ pub fn run_dequant(
                 .us(nsub)?
                 .i(qtype_code(dtype))
                 .us(dtype.block_size())?
-                .us(dtype.type_size())?;
+                .us(super::dev_type_size(dtype))?;
             d.launch(
                 "dequant",
                 glsl::k_dequant,
@@ -3119,7 +3119,7 @@ pub fn run_qembed(
         .us(k)?
         .i(qtype_code(dtype))
         .us(dtype.block_size())?
-        .us(dtype.type_size())?
+        .us(super::dev_type_size(dtype))?
         .us(ids_off)?
         .us(vocab)?
         .i(fslot());
@@ -3422,7 +3422,7 @@ mod precise_perf_tests {
                     .us(k)?
                     .i(qtype_code(dtype))
                     .us(dtype.block_size())?
-                    .us(dtype.type_size())?
+                    .us(super::dev_type_size(dtype))?
                     .i(0)
                     .i(0)
                     .i(1))

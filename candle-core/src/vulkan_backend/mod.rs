@@ -2257,6 +2257,22 @@ impl BackendDevice for VulkanDevice {
 const QGEMV_MAX_ROWS: usize = 16;
 
 /// A GGUF-block-quantized tensor held on the device in its on-disk format.
+/// Whether Q6_K blocks are stored padded to 212 bytes on the device
+/// (`CANDLE_VULKAN_Q6K_PAD=0` keeps the 210-byte GGUF stride).
+pub fn q6k_padded() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANDLE_VULKAN_Q6K_PAD").map_or(true, |v| v != "0"))
+}
+
+/// Device block stride of `dtype` (GGUF `type_size`, Q6_K padded to 212).
+pub fn dev_type_size(dtype: GgmlDType) -> usize {
+    if dtype == GgmlDType::Q6K && q6k_padded() {
+        212
+    } else {
+        dtype.type_size()
+    }
+}
+
 pub struct QVulkanStorage {
     inner: VulkanStorage,
     dtype: GgmlDType,
@@ -2275,6 +2291,17 @@ impl std::fmt::Debug for QVulkanStorage {
 
 impl QVulkanStorage {
     fn bytes_for(dtype: GgmlDType, elem_count: usize) -> Result<usize> {
+        let bs = dtype.block_size();
+        if !elem_count.is_multiple_of(bs) {
+            return Err(Error::Msg(format!(
+                "vulkan: {elem_count} elements is not a whole number of {dtype:?} blocks"
+            )));
+        }
+        Ok(elem_count / bs * dev_type_size(dtype))
+    }
+
+    /// Bytes of the GGUF (host) representation.
+    fn host_bytes_for(dtype: GgmlDType, elem_count: usize) -> Result<usize> {
         let bs = dtype.block_size();
         if !elem_count.is_multiple_of(bs) {
             return Err(Error::Msg(format!(
@@ -2301,15 +2328,29 @@ impl QVulkanStorage {
         elem_count: usize,
         data: &[u8],
     ) -> Result<Self> {
-        let bytes = Self::bytes_for(dtype, elem_count)?;
-        if data.len() < bytes {
+        let host = Self::host_bytes_for(dtype, elem_count)?;
+        if data.len() < host {
             return Err(Error::Msg(format!(
-                "vulkan: {} bytes given for a {dtype:?} tensor needing {bytes}",
+                "vulkan: {} bytes given for a {dtype:?} tensor needing {host}",
                 data.len()
             )));
         }
+        let bytes = Self::bytes_for(dtype, elem_count)?;
         let inner = device.alloc(DType::U8, bytes)?;
-        unsafe { inner.set_bytes(&data[..bytes]) }?;
+        if bytes == host {
+            unsafe { inner.set_bytes(&data[..bytes]) }?;
+        } else {
+            // Q6_K: pad 210-byte blocks to a word-aligned 212-byte stride.
+            let (hs, ds) = (dtype.type_size(), dev_type_size(dtype));
+            let mut padded = vec![0u8; bytes];
+            for (src, dst) in data[..host]
+                .chunks_exact(hs)
+                .zip(padded.chunks_exact_mut(ds))
+            {
+                dst[..hs].copy_from_slice(src);
+            }
+            unsafe { inner.set_bytes(&padded) }?;
+        }
         Ok(Self {
             inner,
             dtype,
@@ -2335,7 +2376,18 @@ impl QVulkanStorage {
 
     /// Read the block bytes back to the host.
     pub fn data(&self) -> Result<Vec<u8>> {
-        self.inner.get_bytes(self.storage_size_in_bytes())
+        let raw = self
+            .inner
+            .get_bytes(Self::bytes_for(self.dtype, self.elem_count)?)?;
+        let (hs, ds) = (self.dtype.type_size(), dev_type_size(self.dtype));
+        if hs == ds {
+            return Ok(raw);
+        }
+        let mut out = Vec::with_capacity(raw.len() / ds * hs);
+        for block in raw.chunks_exact(ds) {
+            out.extend_from_slice(&block[..hs]);
+        }
+        Ok(out)
     }
 
     /// Dequantize to an f32 storage on the device.

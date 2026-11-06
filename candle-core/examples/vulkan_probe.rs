@@ -138,9 +138,27 @@ fn main() -> Result<()> {
                     *k,
                 ));
             }
-            rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-            for (t, name, n, k) in rows.iter().take(8) {
-                println!("   {:7.3} ms  {name} [{n}x{k}]", t * 1e3);
+            // aggregate by (shape, dtype): total time and effective GB/s
+            let mut agg: std::collections::BTreeMap<(usize, usize, String), (usize, f64, usize)> =
+                Default::default();
+            for (t, name, n, k) in &rows {
+                let info = &content.tensor_infos[name];
+                let dt = format!("{:?}", info.ggml_dtype);
+                let bytes = n * k / info.ggml_dtype.block_size() * info.ggml_dtype.type_size();
+                let e = agg.entry((*n, *k, dt)).or_default();
+                e.0 += 1;
+                e.1 += t;
+                e.2 += bytes;
+            }
+            let mut v: Vec<_> = agg.into_iter().collect();
+            v.sort_by(|a, b| (b.1).1.partial_cmp(&(a.1).1).unwrap());
+            for ((n, k, dt), (c, t, b)) in v {
+                println!(
+                    "   {:7.3} ms total  {c:3} x [{n}x{k}] {dt:5}  {:6.1} GB/s  {:6.1} us each",
+                    t * 1e3,
+                    b as f64 / t / 1e9,
+                    t / c as f64 * 1e6
+                );
             }
         }
     }

@@ -41,8 +41,18 @@ fn subgroup() -> bool {
     std::env::var("CANDLE_VULKAN_KQ_SUBGROUP").is_ok_and(|v| v == "1")
 }
 
+/// `#define Q6S` (Q6_K device stride) and `Q6A` when blocks are word-aligned.
+fn q6_tail() -> String {
+    if super::q6k_padded() {
+        "#define Q6S 212u\n#define Q6A 1\n".into()
+    } else {
+        "#define Q6S 210u\n".into()
+    }
+}
+
 fn source(wg: usize, nr: usize) -> String {
     let mut s = super::glsl::prelude(wg, 3);
+    s += &q6_tail();
     if subgroup() {
         // `#extension` must follow `#version` (the prelude's first line).
         s = s.replacen(
@@ -60,11 +70,15 @@ layout(push_constant) uniform PC { int N; int K; int xoff; int coff; int M; int 
 layout(local_size_x = WG) in;
 shared float sh[SHN];
 
+#ifdef Q6A
+uint wword(uint off) { return W[off >> 2u]; }
+#else
 uint wword(uint off) {
     uint i = off >> 2u;
     uint s = (off & 3u) * 8u;
     return s == 0u ? W[i] : ((W[i] >> s) | (W[i + 1u] << (32u - s)));
 }
+#endif
 uint bsel(uint w0, uint w1, uint w2, int i) {
     uint w = i < 4 ? w0 : (i < 8 ? w1 : w2);
     return (w >> uint(8 * (i & 3))) & 0xFFu;
@@ -136,7 +150,7 @@ void main() {
             for (int r = 0; r < NR; r++) {
                 int n = n0 + r;
                 if (n >= pc.N) break;
-                uint p = (uint(n) * uint(nb) + uint(b)) * 210u;
+                uint p = (uint(n) * uint(nb) + uint(b)) * Q6S;
                 uint qa = wword(p + uint(64 * half_ + l0));
                 uint qb = wword(p + uint(64 * half_ + 32 + l0));
                 uint qh = wword(p + 128u + uint(32 * half_ + l0));
@@ -202,6 +216,7 @@ void main() {
 /// rows. Grid: (rows / NR) x (M / MT).
 fn source_mm(wg: usize, nr: usize, mt: usize) -> String {
     let mut s = super::glsl::prelude(wg, 3);
+    s += &q6_tail();
     s += &format!("#define NR {nr}\n#define MT {mt}\n");
     s += r#"
 layout(std430, set = 0, binding = 0) readonly buffer B0 { float X[]; };
@@ -211,11 +226,15 @@ layout(push_constant) uniform PC { int N; int K; int xoff; int coff; int M; int 
 layout(local_size_x = WG) in;
 shared float sh[WG];
 
+#ifdef Q6A
+uint wword(uint off) { return W[off >> 2u]; }
+#else
 uint wword(uint off) {
     uint i = off >> 2u;
     uint s = (off & 3u) * 8u;
     return s == 0u ? W[i] : ((W[i] >> s) | (W[i + 1u] << (32u - s)));
 }
+#endif
 uint bsel(uint w0, uint w1, uint w2, int i) {
     uint w = i < 4 ? w0 : (i < 8 ? w1 : w2);
     return (w >> uint(8 * (i & 3))) & 0xFFu;
@@ -267,7 +286,7 @@ void main() {
                 }
             } else {
                 int half_ = lane >> 3; int l0 = (lane & 7) * 4; int is = l0 / 16;
-                uint p = (uint(n) * uint(nb) + uint(b)) * 210u;
+                uint p = (uint(n) * uint(nb) + uint(b)) * Q6S;
                 uint qa = wword(p + uint(64 * half_ + l0));
                 uint qb = wword(p + uint(64 * half_ + 32 + l0));
                 uint qh = wword(p + 128u + uint(32 * half_ + l0));
@@ -321,6 +340,7 @@ void main() {
 /// micro-tile. Grid: (N / TN) x (M / TM).
 fn source_tiled() -> String {
     let mut s = super::glsl::prelude(256, 3);
+    s += &q6_tail();
     s += r#"
 #define TM 64
 #define TN 64
@@ -332,11 +352,15 @@ layout(local_size_x = 256) in;
 shared float Ws[TN * 33];
 shared float Xs[TM * 33];
 
+#ifdef Q6A
+uint wword(uint off) { return W[off >> 2u]; }
+#else
 uint wword(uint off) {
     uint i = off >> 2u;
     uint s = (off & 3u) * 8u;
     return s == 0u ? W[i] : ((W[i] >> s) | (W[i + 1u] << (32u - s)));
 }
+#endif
 uint bsel(uint w0, uint w1, uint w2, int i) {
     uint w = i < 4 ? w0 : (i < 8 ? w1 : w2);
     return (w >> uint(8 * (i & 3))) & 0xFFu;
@@ -386,7 +410,7 @@ void main() {
                     w[4 + i] = a * float((q1 >> (uint(8 * i) + sh_)) & 15u) - c;
                 }
             } else {
-                uint p = (uint(n) * uint(nb) + uint(b)) * 210u;
+                uint p = (uint(n) * uint(nb) + uint(b)) * Q6S;
                 int half_ = j >> 2; int q = j & 3;
                 uint qa0 = wword(p + uint(64 * half_ + (q & 1) * 32 + lq));
                 uint qa1 = wword(p + uint(64 * half_ + (q & 1) * 32 + lq + 4));
@@ -433,6 +457,7 @@ void main() {
 /// thread t loads token row t and weight row t (one full 32-value sub-block).
 fn source_tiled8() -> String {
     let mut s = super::glsl::prelude(64, 3);
+    s += &q6_tail();
     s += r#"
 #define T 64
 #define LD 33
@@ -444,11 +469,15 @@ layout(local_size_x = 64) in;
 shared float Ws[T * LD];
 shared float Xs[T * LD];
 
+#ifdef Q6A
+uint wword(uint off) { return W[off >> 2u]; }
+#else
 uint wword(uint off) {
     uint i = off >> 2u;
     uint s = (off & 3u) * 8u;
     return s == 0u ? W[i] : ((W[i] >> s) | (W[i + 1u] << (32u - s)));
 }
+#endif
 uint bsel(uint w0, uint w1, uint w2, int i) {
     uint w = i < 4 ? w0 : (i < 8 ? w1 : w2);
     return (w >> uint(8 * (i & 3))) & 0xFFu;
@@ -491,7 +520,7 @@ void main() {
                     for (int i = 0; i < 4; i++) Ws[t * LD + wi * 4 + i] = a * float((q >> (uint(8 * i) + sh_)) & 15u) - c;
                 }
             } else {
-                uint p = (uint(n) * uint(nb) + uint(b)) * 210u;
+                uint p = (uint(n) * uint(nb) + uint(b)) * Q6S;
                 int half_ = j >> 2; int q = j & 3;
                 uint dp = p + 208u;
                 float d = unpackHalf2x16((W[dp >> 2u] >> ((dp & 3u) * 8u)) & 0xFFFFu).x;
@@ -542,6 +571,7 @@ void main() {
 /// except the NR accumulators.
 fn source_v4(wg: usize, nr: usize) -> String {
     let mut s = super::glsl::prelude(wg, 3);
+    s += &q6_tail();
     s += &format!("#define NR {nr}\n#define SHN {}\n", wg.max(8 * nr));
     s += r#"
 layout(std430, set = 0, binding = 0) readonly buffer B0 { vec4 X4[]; };
@@ -551,11 +581,15 @@ layout(push_constant) uniform PC { int N; int K; int xoff; int coff; int M; int 
 layout(local_size_x = WG) in;
 shared float sh[SHN];
 
+#ifdef Q6A
+uint wword(uint off) { return W[off >> 2u]; }
+#else
 uint wword(uint off) {
     uint i = off >> 2u;
     uint s = (off & 3u) * 8u;
     return s == 0u ? W[i] : ((W[i] >> s) | (W[i + 1u] << (32u - s)));
 }
+#endif
 uint bsel(uint w0, uint w1, uint w2, int i) {
     uint w = i < 4 ? w0 : (i < 8 ? w1 : w2);
     return (w >> uint(8 * (i & 3))) & 0xFFu;
@@ -622,7 +656,7 @@ void main() {
             for (int r = 0; r < NR; r++) {
                 int n = n0 + r;
                 if (n >= pc.N) break;
-                uint p = (uint(n) * uint(nb) + uint(b)) * 210u;
+                uint p = (uint(n) * uint(nb) + uint(b)) * Q6S;
                 uint qa = wword(p + uint(64 * half_ + l0));
                 uint qb = wword(p + uint(64 * half_ + 32 + l0));
                 uint qh = wword(p + 128u + uint(32 * half_ + l0));
@@ -661,6 +695,7 @@ void main() {
 /// 8 lanes per super-block, 16 quant bytes per lane (Q4_K: one uvec4 of qs).
 fn source_v8(wg: usize, nr: usize) -> String {
     let mut s = super::glsl::prelude(wg, 3);
+    s += &q6_tail();
     s += &format!("#define NR {nr}\n#define SHN {}\n", wg.max(8 * nr));
     s += r#"
 layout(std430, set = 0, binding = 0) readonly buffer B0 { vec4 X4[]; };
@@ -670,11 +705,15 @@ layout(push_constant) uniform PC { int N; int K; int xoff; int coff; int M; int 
 layout(local_size_x = WG) in;
 shared float sh[SHN];
 
+#ifdef Q6A
+uint wword(uint off) { return W[off >> 2u]; }
+#else
 uint wword(uint off) {
     uint i = off >> 2u;
     uint s = (off & 3u) * 8u;
     return s == 0u ? W[i] : ((W[i] >> s) | (W[i + 1u] << (32u - s)));
 }
+#endif
 uint bsel(uint w0, uint w1, uint w2, int i) {
     uint w = i < 4 ? w0 : (i < 8 ? w1 : w2);
     return (w >> uint(8 * (i & 3))) & 0xFFu;
@@ -743,7 +782,7 @@ void main() {
             for (int r = 0; r < NR; r++) {
                 int n = n0 + r;
                 if (n >= pc.N) break;
-                uint p = (uint(n) * uint(nb) + uint(b)) * 210u;
+                uint p = (uint(n) * uint(nb) + uint(b)) * Q6S;
                 uint qa0 = wword(p + uint(64 * half_ + l0)); uint qa1 = wword(p + uint(64 * half_ + l0 + 4));
                 uint qb0 = wword(p + uint(64 * half_ + 32 + l0)); uint qb1 = wword(p + uint(64 * half_ + 32 + l0 + 4));
                 uint qh0 = wword(p + 128u + uint(32 * half_ + l0)); uint qh1 = wword(p + 128u + uint(32 * half_ + l0 + 4));
