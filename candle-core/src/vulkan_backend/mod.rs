@@ -2273,6 +2273,20 @@ pub fn dev_type_size(dtype: GgmlDType) -> usize {
     }
 }
 
+/// GGUF block bytes in the device layout (Q6_K padded to `dev_type_size`).
+pub fn to_device_layout(dtype: GgmlDType, data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let (hs, ds) = (dtype.type_size(), dev_type_size(dtype));
+    if hs == ds {
+        return std::borrow::Cow::Borrowed(data);
+    }
+    let blocks = data.len() / hs;
+    let mut padded = vec![0u8; blocks * ds];
+    for (src, dst) in data.chunks_exact(hs).zip(padded.chunks_exact_mut(ds)) {
+        dst[..hs].copy_from_slice(src);
+    }
+    std::borrow::Cow::Owned(padded)
+}
+
 pub struct QVulkanStorage {
     inner: VulkanStorage,
     dtype: GgmlDType,
@@ -2337,20 +2351,8 @@ impl QVulkanStorage {
         }
         let bytes = Self::bytes_for(dtype, elem_count)?;
         let inner = device.alloc(DType::U8, bytes)?;
-        if bytes == host {
-            unsafe { inner.set_bytes(&data[..bytes]) }?;
-        } else {
-            // Q6_K: pad 210-byte blocks to a word-aligned 212-byte stride.
-            let (hs, ds) = (dtype.type_size(), dev_type_size(dtype));
-            let mut padded = vec![0u8; bytes];
-            for (src, dst) in data[..host]
-                .chunks_exact(hs)
-                .zip(padded.chunks_exact_mut(ds))
-            {
-                dst[..hs].copy_from_slice(src);
-            }
-            unsafe { inner.set_bytes(&padded) }?;
-        }
+        // Q6_K: 210-byte blocks padded to a word-aligned 212-byte stride.
+        unsafe { inner.set_bytes(&to_device_layout(dtype, &data[..host])) }?;
         Ok(Self {
             inner,
             dtype,
@@ -3626,7 +3628,7 @@ mod tests {
             let q = QTensor::quantize(&w, dtype)?;
             let wref = q.dequantize(&cpu)?;
             let bytes = q.data()?.into_owned();
-            let wbuf = vd.storage_from_slice(&bytes)?;
+            let wbuf = vd.storage_from_slice(&to_device_layout(dtype, &bytes))?;
             let xbuf = vd.storage_from_slice(&xv)?;
             let mut variants = vec![
                 kernels::Qgemv::Generic,

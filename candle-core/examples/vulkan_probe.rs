@@ -163,6 +163,25 @@ fn main() -> Result<()> {
         }
     }
 
+    // argmax over a 128k row (greedy sampling): correctness + time
+    {
+        let v = Tensor::randn(0f32, 1.0, 128000, &Device::Cpu)?;
+        let vg = v.to_device(&dev)?;
+        let a_cpu = v.argmax(0)?.to_scalar::<u32>()?;
+        let a_gpu = vg.argmax(0)?.to_scalar::<u32>()?;
+        dev.synchronize()?;
+        let t0 = Instant::now();
+        for _ in 0..50 {
+            vg.argmax(0)?;
+        }
+        dev.synchronize()?;
+        println!(
+            "argmax 128k: cpu {a_cpu} gpu {a_gpu} {}  {:.1} us/call",
+            if a_cpu == a_gpu { "OK" } else { "MISMATCH" },
+            t0.elapsed().as_secs_f64() / 50.0 * 1e6
+        );
+    }
+
     // raw read bandwidth roof: each invocation sums uvec4s with a grid stride
     {
         use candle_core::backend::BackendStorage;

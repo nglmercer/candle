@@ -818,6 +818,91 @@ void main() {
     s
 }
 
+fn source_v8_q4v(wg: usize, nr: usize) -> String {
+    let mut s = super::glsl::prelude(wg, 3);
+    s += &q6_tail();
+    s += &format!("#define NR {nr}\n#define SHN {}\n", wg.max(8 * nr));
+    s += r#"
+layout(std430, set = 0, binding = 0) readonly buffer B0 { vec4 X4[]; };
+layout(std430, set = 0, binding = 1) readonly buffer B1 { uvec4 W4[]; };
+layout(std430, set = 0, binding = 2) buffer B2 { float C[]; };
+layout(push_constant) uniform PC { int N; int K; int xoff; int coff; int M; int qt; } pc;
+layout(local_size_x = WG) in;
+shared float sh[SHN];
+
+
+uint bsel(uint w0, uint w1, uint w2, int i) {
+    uint w = i < 4 ? w0 : (i < 8 ? w1 : w2);
+    return (w >> uint(8 * (i & 3))) & 0xFFu;
+}
+const uvec4 SH8 = uvec4(0u, 8u, 16u, 24u);
+vec4 nib_lo(uint q) { return vec4((uvec4(q) >> SH8) & 15u); }
+vec4 nib_hi(uint q) { return vec4((uvec4(q) >> (SH8 + 4u)) & 15u); }
+vec4 q6(uint ql, uint qh, uint lsh, uint hsh) {
+    uvec4 lo = (uvec4(ql) >> (SH8 + lsh)) & 15u;
+    uvec4 hi = (uvec4(qh) >> (SH8 + hsh)) & 3u;
+    return vec4(ivec4(lo | (hi << 4u)) - 32);
+}
+
+void main() {
+    int n0 = grow() * NR;
+    int m = int(gl_WorkGroupID.z);
+    int t = int(gl_LocalInvocationID.x);
+    float acc[NR];
+    for (int r = 0; r < NR; r++) acc[r] = 0.0;
+    int lane = t & 7;
+    int nb = pc.K / 256;
+    int x0 = (pc.xoff + m * pc.K) >> 2;
+    if (pc.qt == 12) {
+        int g = lane >> 1;
+        int l = (lane & 1) * 16;
+        int j0 = 2 * g; int j1 = j0 + 1;
+        for (int b = t >> 3; b < nb; b += WG / 8) {
+            int xa = x0 + ((b * 256 + 64 * g + l) >> 2);
+            vec4 a0 = X4[xa]; vec4 a1 = X4[xa + 1]; vec4 a2 = X4[xa + 2]; vec4 a3 = X4[xa + 3];
+            vec4 c0 = X4[xa + 8]; vec4 c1 = X4[xa + 9]; vec4 c2 = X4[xa + 10]; vec4 c3 = X4[xa + 11];
+            float slo = dot(a0 + a1 + a2 + a3, vec4(1.0));
+            float shi = dot(c0 + c1 + c2 + c3, vec4(1.0));
+            for (int r = 0; r < NR; r++) {
+                int n = n0 + r;
+                if (n >= pc.N) break;
+                uint wb = (uint(n) * uint(nb) + uint(b)) * 9u;
+                uvec4 hdr = W4[wb];
+                vec2 dm = unpackHalf2x16(hdr.x);
+                uint s0 = hdr.y; uint s1 = hdr.z; uint s2 = hdr.w;
+                float sc0; float mn0; float sc1; float mn1;
+                if (j0 < 4) {
+                    sc0 = float(bsel(s0, s1, s2, j0) & 63u); mn0 = float(bsel(s0, s1, s2, j0 + 4) & 63u);
+                    sc1 = float(bsel(s0, s1, s2, j1) & 63u); mn1 = float(bsel(s0, s1, s2, j1 + 4) & 63u);
+                } else {
+                    sc0 = float((bsel(s0, s1, s2, j0 + 4) & 15u) | ((bsel(s0, s1, s2, j0 - 4) >> 6u) << 4u));
+                    mn0 = float((bsel(s0, s1, s2, j0 + 4) >> 4u) | ((bsel(s0, s1, s2, j0) >> 6u) << 4u));
+                    sc1 = float((bsel(s0, s1, s2, j1 + 4) & 15u) | ((bsel(s0, s1, s2, j1 - 4) >> 6u) << 4u));
+                    mn1 = float((bsel(s0, s1, s2, j1 + 4) >> 4u) | ((bsel(s0, s1, s2, j1) >> 6u) << 4u));
+                }
+                uvec4 qv = W4[wb + 1u + uint(lane)];
+                uint q0 = qv.x; uint q1 = qv.y; uint q2 = qv.z; uint q3 = qv.w;
+                float dlo = dot(a0, nib_lo(q0)) + dot(a1, nib_lo(q1)) + dot(a2, nib_lo(q2)) + dot(a3, nib_lo(q3));
+                float dhi = dot(c0, nib_hi(q0)) + dot(c1, nib_hi(q1)) + dot(c2, nib_hi(q2)) + dot(c3, nib_hi(q3));
+                acc[r] += dm.x * (sc0 * dlo + sc1 * dhi) - dm.y * (mn0 * slo + mn1 * shi);
+            }
+        }
+    }
+    for (int r = 0; r < NR; r++) {
+        sh[t] = acc[r];
+        barrier();
+        for (int s = WG / 2; s > 0; s >>= 1) {
+            if (t < s) sh[t] += sh[t + s];
+            barrier();
+        }
+        if (t == 0 && n0 + r < pc.N) C[pc.coff + m * pc.N + n0 + r] = sh[0];
+        barrier();
+    }
+}
+"#;
+    s
+}
+
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -892,6 +977,17 @@ pub fn run(
     let gx = groups.min(lim.max_groups_x as usize).max(1);
     let gy = groups.div_ceil(gx);
     let push = Push::default().us(n)?.us(k)?.us(xoff)?.i(0).us(m)?.i(qt);
+    if qt == 12 && xoff % 4 == 0 && std::env::var("CANDLE_VULKAN_KQ_Q4V").map_or(true, |v| v != "0")
+    {
+        return d.launch(
+            &format!("kq_gemv_q4v_{wg}_{nr}"),
+            |_| source_v8_q4v(wg, nr),
+            &[x, w, out],
+            push,
+            &[],
+            [gx as u32, gy as u32, m as u32],
+        );
+    }
     if xoff % 4 == 0 && std::env::var("CANDLE_VULKAN_KQ_VEC").map_or(true, |v| v == "8") {
         return d.launch(
             &format!("kq_gemv_v8_{wg}_{nr}"),

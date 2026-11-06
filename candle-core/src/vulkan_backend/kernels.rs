@@ -1939,6 +1939,37 @@ pub fn run_arg_last(
     cols: usize,
     off: usize,
 ) -> Result<()> {
+    // Few long rows (e.g. greedy sampling over a 128k vocabulary): split each
+    // row over G work-groups, then combine the G partial winners.
+    if rows <= 8 && cols >= 32768 && std::env::var("CANDLE_VULKAN_ARG2").is_ok_and(|v| v == "1") {
+        let g = (cols / 2048).clamp(2, 256);
+        let pv = d.alloc(crate::DType::F32, rows * g)?;
+        let pi = d.alloc(crate::DType::U32, rows * g)?;
+        let lim = d.limits();
+        let push = Push::default()
+            .us(rows)?
+            .us(cols)?
+            .us(off)?
+            .i(is_max as i32)
+            .us(g)?;
+        d.launch(
+            "arg_partial",
+            arg_partial_src,
+            &[x, pv.buf(), pi.buf()],
+            push,
+            &[],
+            row_grid(rows * g, 1, lim.max_groups_x),
+        )?;
+        let push = Push::default().us(rows)?.us(g)?.i(is_max as i32);
+        return d.launch(
+            "arg_final",
+            arg_final_src,
+            &[pv.buf(), pi.buf(), out],
+            push,
+            &[],
+            row_grid(rows, 1, lim.max_groups_x),
+        );
+    }
     let push = Push::default()
         .us(rows)?
         .us(cols)?
@@ -1953,6 +1984,79 @@ pub fn run_arg_last(
         &[],
         row_grid(rows, 1, lim.max_groups_x),
     )
+}
+
+const ARG_REDUCE: &str = r#"
+    shv[t] = best; shi[t] = bi;
+    barrier();
+    for (int s = WG / 2; s > 0; s >>= 1) {
+        if (t < s) {
+            float a = shv[t]; float b = shv[t + s];
+            bool take = mx ? (b > a || (b == a && shi[t + s] < shi[t])) : (b < a || (b == a && shi[t + s] < shi[t]));
+            if (take) { shv[t] = b; shi[t] = shi[t + s]; }
+        }
+        barrier();
+    }
+"#;
+
+fn arg_partial_src(wg: usize) -> String {
+    let mut s = glsl::prelude(wg, 3);
+    s += r#"
+layout(std430, set = 0, binding = 0) readonly buffer B0 { float x[]; };
+layout(std430, set = 0, binding = 1) buffer B1 { float pv[]; };
+layout(std430, set = 0, binding = 2) buffer B2 { uint pi[]; };
+layout(push_constant) uniform PC { int rows; int cols; int off; int is_max; int g; } pc;
+layout(local_size_x = WG) in;
+shared float shv[WG];
+shared uint shi[WG];
+void main() {
+    int rg = grow();
+    int t = int(gl_LocalInvocationID.x);
+    if (rg >= pc.rows * pc.g) return;
+    int row = rg / pc.g; int gi = rg - row * pc.g;
+    int chunk = (pc.cols + pc.g - 1) / pc.g;
+    int c0 = gi * chunk; int c1 = min(pc.cols, c0 + chunk);
+    int base = pc.off + row * pc.cols;
+    bool mx = pc.is_max != 0;
+    float best = mx ? NINF() : INF();
+    uint bi = uint(c0);
+    for (int c = c0 + t; c < c1; c += WG) {
+        float v = x[base + c];
+        bool better = mx ? (v > best) : (v < best);
+        if (better) { best = v; bi = uint(c); }
+    }
+"#;
+    s += ARG_REDUCE;
+    s += "    if (t == 0) { pv[rg] = shv[0]; pi[rg] = shi[0]; }\n}\n";
+    s
+}
+
+fn arg_final_src(wg: usize) -> String {
+    let mut s = glsl::prelude(wg, 3);
+    s += r#"
+layout(std430, set = 0, binding = 0) readonly buffer B0 { float pv[]; };
+layout(std430, set = 0, binding = 1) readonly buffer B1 { uint pi[]; };
+layout(std430, set = 0, binding = 2) buffer B2 { uint o[]; };
+layout(push_constant) uniform PC { int rows; int g; int is_max; } pc;
+layout(local_size_x = WG) in;
+shared float shv[WG];
+shared uint shi[WG];
+void main() {
+    int row = grow();
+    int t = int(gl_LocalInvocationID.x);
+    if (row >= pc.rows) return;
+    bool mx = pc.is_max != 0;
+    float best = mx ? NINF() : INF();
+    uint bi = 0xFFFFFFFFu;
+    for (int i = t; i < pc.g; i += WG) {
+        float v = pv[row * pc.g + i]; uint id = pi[row * pc.g + i];
+        bool better = mx ? (v > best || (v == best && id < bi)) : (v < best || (v == best && id < bi));
+        if (better) { best = v; bi = id; }
+    }
+"#;
+    s += ARG_REDUCE;
+    s += "    if (t == 0) o[row] = shi[0];\n}\n";
+    s
 }
 
 pub fn run_reduce_generic(
@@ -2598,7 +2702,7 @@ pub fn run_qgemv_f64(
         .us(k)?
         .i(qtype_code(dtype))
         .us(dtype.block_size())?
-        .us(super::dev_type_size(dtype))?
+        .us(crate::vulkan_backend::dev_type_size(dtype))?
         .us(off)?
         .i(0)
         .us(m)?;
@@ -2785,7 +2889,7 @@ pub fn run_qgemv_with(
         .us(k)?
         .i(qtype_code(dtype))
         .us(dtype.block_size())?
-        .us(super::dev_type_size(dtype))?
+        .us(crate::vulkan_backend::dev_type_size(dtype))?
         .us(xoff)?
         .i(0)
         .us(m)?;
@@ -2839,7 +2943,7 @@ pub fn run_qgemv_with(
                 .us(k)?
                 .i(qtype_code(dtype))
                 .us(dtype.block_size())?
-                .us(super::dev_type_size(dtype))?
+                .us(crate::vulkan_backend::dev_type_size(dtype))?
                 .i(0)
                 .us(m)?;
             let groups = row_grid(
@@ -3058,7 +3162,7 @@ pub fn run_dequant(
                 .us(nsub)?
                 .i(qtype_code(dtype))
                 .us(dtype.block_size())?
-                .us(super::dev_type_size(dtype))?;
+                .us(crate::vulkan_backend::dev_type_size(dtype))?;
             d.launch(
                 "dequant",
                 glsl::k_dequant,
@@ -3119,7 +3223,7 @@ pub fn run_qembed(
         .us(k)?
         .i(qtype_code(dtype))
         .us(dtype.block_size())?
-        .us(super::dev_type_size(dtype))?
+        .us(crate::vulkan_backend::dev_type_size(dtype))?
         .us(ids_off)?
         .us(vocab)?
         .i(fslot());
@@ -3422,7 +3526,7 @@ mod precise_perf_tests {
                     .us(k)?
                     .i(qtype_code(dtype))
                     .us(dtype.block_size())?
-                    .us(super::dev_type_size(dtype))?
+                    .us(crate::vulkan_backend::dev_type_size(dtype))?
                     .i(0)
                     .i(0)
                     .i(1))
