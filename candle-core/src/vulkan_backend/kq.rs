@@ -37,16 +37,28 @@ pub fn supports(dtype: GgmlDType, k: usize) -> bool {
     enabled() && matches!(dtype, GgmlDType::Q4K | GgmlDType::Q6K) && k % 256 == 0
 }
 
+fn subgroup() -> bool {
+    std::env::var("CANDLE_VULKAN_KQ_SUBGROUP").is_ok_and(|v| v == "1")
+}
+
 fn source(wg: usize, nr: usize) -> String {
     let mut s = super::glsl::prelude(wg, 3);
-    s += &format!("#define NR {nr}\n");
+    if subgroup() {
+        // `#extension` must follow `#version` (the prelude's first line).
+        s = s.replacen(
+            "\n",
+            "\n#extension GL_KHR_shader_subgroup_basic : enable\n#extension GL_KHR_shader_subgroup_arithmetic : enable\n#define SUBGROUP 1\n",
+            1,
+        );
+    }
+    s += &format!("#define NR {nr}\n#define SHN {}\n", wg.max(8 * nr));
     s += r#"
 layout(std430, set = 0, binding = 0) readonly buffer B0 { float X[]; };
 layout(std430, set = 0, binding = 1) readonly buffer B1 { uint W[]; };
 layout(std430, set = 0, binding = 2) buffer B2 { float C[]; };
 layout(push_constant) uniform PC { int N; int K; int xoff; int coff; int M; int qt; } pc;
 layout(local_size_x = WG) in;
-shared float sh[WG];
+shared float sh[SHN];
 
 uint wword(uint off) {
     uint i = off >> 2u;
@@ -152,6 +164,23 @@ void main() {
             }
         }
     }
+#ifdef SUBGROUP
+    for (int r = 0; r < NR; r++) {
+        float v = subgroupAdd(acc[r]);
+        if (subgroupElect() && n0 + r < pc.N) {
+            if (gl_NumSubgroups == 1u) C[pc.coff + m * pc.N + n0 + r] = v;
+            else sh[r * 8 + int(gl_SubgroupID)] = v;
+        }
+    }
+    if (gl_NumSubgroups > 1u) {
+        barrier();
+        if (t < NR && n0 + t < pc.N) {
+            float v = 0.0;
+            for (uint i = 0u; i < gl_NumSubgroups; i++) v += sh[t * 8 + int(i)];
+            C[pc.coff + m * pc.N + n0 + t] = v;
+        }
+    }
+#else
     for (int r = 0; r < NR; r++) {
         sh[t] = acc[r];
         barrier();
@@ -162,6 +191,7 @@ void main() {
         if (t == 0 && n0 + r < pc.N) C[pc.coff + m * pc.N + n0 + r] = sh[0];
         barrier();
     }
+#endif
 }
 "#;
     s
@@ -507,6 +537,248 @@ void main() {
     s
 }
 
+/// vec4 variant of the decode GEMV: X bound as vec4[] (requires xoff % 4 == 0),
+/// nibbles expanded with uvec4 shifts and reduced with dot(); no local arrays
+/// except the NR accumulators.
+fn source_v4(wg: usize, nr: usize) -> String {
+    let mut s = super::glsl::prelude(wg, 3);
+    s += &format!("#define NR {nr}\n#define SHN {}\n", wg.max(8 * nr));
+    s += r#"
+layout(std430, set = 0, binding = 0) readonly buffer B0 { vec4 X4[]; };
+layout(std430, set = 0, binding = 1) readonly buffer B1 { uint W[]; };
+layout(std430, set = 0, binding = 2) buffer B2 { float C[]; };
+layout(push_constant) uniform PC { int N; int K; int xoff; int coff; int M; int qt; } pc;
+layout(local_size_x = WG) in;
+shared float sh[SHN];
+
+uint wword(uint off) {
+    uint i = off >> 2u;
+    uint s = (off & 3u) * 8u;
+    return s == 0u ? W[i] : ((W[i] >> s) | (W[i + 1u] << (32u - s)));
+}
+uint bsel(uint w0, uint w1, uint w2, int i) {
+    uint w = i < 4 ? w0 : (i < 8 ? w1 : w2);
+    return (w >> uint(8 * (i & 3))) & 0xFFu;
+}
+const uvec4 SH8 = uvec4(0u, 8u, 16u, 24u);
+vec4 nib_lo(uint q) { return vec4((uvec4(q) >> SH8) & 15u); }
+vec4 nib_hi(uint q) { return vec4((uvec4(q) >> (SH8 + 4u)) & 15u); }
+vec4 q6(uint ql, uint qh, uint lsh, uint hsh) {
+    uvec4 lo = (uvec4(ql) >> (SH8 + lsh)) & 15u;
+    uvec4 hi = (uvec4(qh) >> (SH8 + hsh)) & 3u;
+    return vec4(ivec4(lo | (hi << 4u)) - 32);
+}
+
+void main() {
+    int n0 = grow() * NR;
+    int m = int(gl_WorkGroupID.z);
+    int t = int(gl_LocalInvocationID.x);
+    float acc[NR];
+    for (int r = 0; r < NR; r++) acc[r] = 0.0;
+    int lane = t & 15;
+    int nb = pc.K / 256;
+    int x0 = (pc.xoff + m * pc.K) >> 2;   // in vec4 units
+    if (pc.qt == 12) {
+        int g = lane >> 2;
+        int l = (lane & 3) * 8;
+        int j0 = 2 * g;
+        int j1 = j0 + 1;
+        for (int b = t >> 4; b < nb; b += WG / 16) {
+            int xa = x0 + ((b * 256 + 64 * g + l) >> 2);
+            vec4 a0 = X4[xa]; vec4 a1 = X4[xa + 1];
+            vec4 c0 = X4[xa + 8]; vec4 c1 = X4[xa + 9];
+            float slo = dot(a0 + a1, vec4(1.0));
+            float shi = dot(c0 + c1, vec4(1.0));
+            for (int r = 0; r < NR; r++) {
+                int n = n0 + r;
+                if (n >= pc.N) break;
+                uint wb = (uint(n) * uint(nb) + uint(b)) * 36u;
+                vec2 dm = unpackHalf2x16(W[wb]);
+                uint s0 = W[wb + 1u]; uint s1 = W[wb + 2u]; uint s2 = W[wb + 3u];
+                float sc0; float mn0; float sc1; float mn1;
+                if (j0 < 4) {
+                    sc0 = float(bsel(s0, s1, s2, j0) & 63u); mn0 = float(bsel(s0, s1, s2, j0 + 4) & 63u);
+                    sc1 = float(bsel(s0, s1, s2, j1) & 63u); mn1 = float(bsel(s0, s1, s2, j1 + 4) & 63u);
+                } else {
+                    sc0 = float((bsel(s0, s1, s2, j0 + 4) & 15u) | ((bsel(s0, s1, s2, j0 - 4) >> 6u) << 4u));
+                    mn0 = float((bsel(s0, s1, s2, j0 + 4) >> 4u) | ((bsel(s0, s1, s2, j0) >> 6u) << 4u));
+                    sc1 = float((bsel(s0, s1, s2, j1 + 4) & 15u) | ((bsel(s0, s1, s2, j1 - 4) >> 6u) << 4u));
+                    mn1 = float((bsel(s0, s1, s2, j1 + 4) >> 4u) | ((bsel(s0, s1, s2, j1) >> 6u) << 4u));
+                }
+                uint q0 = W[wb + 4u + uint(lane) * 2u];
+                uint q1 = W[wb + 5u + uint(lane) * 2u];
+                float dlo = dot(a0, nib_lo(q0)) + dot(a1, nib_lo(q1));
+                float dhi = dot(c0, nib_hi(q0)) + dot(c1, nib_hi(q1));
+                acc[r] += dm.x * (sc0 * dlo + sc1 * dhi) - dm.y * (mn0 * slo + mn1 * shi);
+            }
+        }
+    } else {
+        int half_ = lane >> 3;
+        int l0 = (lane & 7) * 4;
+        int is = l0 / 16;
+        for (int b = t >> 4; b < nb; b += WG / 16) {
+            int xb = x0 + ((b * 256 + 128 * half_ + l0) >> 2);
+            vec4 x1 = X4[xb]; vec4 x2 = X4[xb + 8]; vec4 x3 = X4[xb + 16]; vec4 x4 = X4[xb + 24];
+            for (int r = 0; r < NR; r++) {
+                int n = n0 + r;
+                if (n >= pc.N) break;
+                uint p = (uint(n) * uint(nb) + uint(b)) * 210u;
+                uint qa = wword(p + uint(64 * half_ + l0));
+                uint qb = wword(p + uint(64 * half_ + 32 + l0));
+                uint qh = wword(p + 128u + uint(32 * half_ + l0));
+                uint dp = p + 208u;
+                float d = unpackHalf2x16((W[dp >> 2u] >> ((dp & 3u) * 8u)) & 0xFFFFu).x;
+                uint scw0 = wword(p + 192u + uint(8 * half_));
+                uint scw1 = wword(p + 196u + uint(8 * half_));
+                uint sb0 = ((is < 4 ? scw0 : scw1) >> uint(8 * (is & 3))) & 0xFFu;
+                uint sb1 = ((is + 2 < 4 ? scw0 : scw1) >> uint(8 * ((is + 2) & 3))) & 0xFFu;
+                uint sb2 = (scw1 >> uint(8 * ((is + 4) & 3))) & 0xFFu;
+                uint sb3 = (scw1 >> uint(8 * ((is + 6) & 3))) & 0xFFu;
+                vec4 scv = vec4(ivec4(sb0, sb1, sb2, sb3) - ivec4(greaterThanEqual(uvec4(sb0, sb1, sb2, sb3), uvec4(128u))) * 256);
+                float s1 = dot(x1, q6(qa, qh, 0u, 0u));
+                float s2 = dot(x2, q6(qb, qh, 0u, 2u));
+                float s3 = dot(x3, q6(qa, qh, 4u, 4u));
+                float s4 = dot(x4, q6(qb, qh, 4u, 6u));
+                acc[r] += d * dot(scv, vec4(s1, s2, s3, s4));
+            }
+        }
+    }
+    for (int r = 0; r < NR; r++) {
+        sh[t] = acc[r];
+        barrier();
+        for (int s = WG / 2; s > 0; s >>= 1) {
+            if (t < s) sh[t] += sh[t + s];
+            barrier();
+        }
+        if (t == 0 && n0 + r < pc.N) C[pc.coff + m * pc.N + n0 + r] = sh[0];
+        barrier();
+    }
+}
+"#;
+    s
+}
+
+/// 8 lanes per super-block, 16 quant bytes per lane (Q4_K: one uvec4 of qs).
+fn source_v8(wg: usize, nr: usize) -> String {
+    let mut s = super::glsl::prelude(wg, 3);
+    s += &format!("#define NR {nr}\n#define SHN {}\n", wg.max(8 * nr));
+    s += r#"
+layout(std430, set = 0, binding = 0) readonly buffer B0 { vec4 X4[]; };
+layout(std430, set = 0, binding = 1) readonly buffer B1 { uint W[]; };
+layout(std430, set = 0, binding = 2) buffer B2 { float C[]; };
+layout(push_constant) uniform PC { int N; int K; int xoff; int coff; int M; int qt; } pc;
+layout(local_size_x = WG) in;
+shared float sh[SHN];
+
+uint wword(uint off) {
+    uint i = off >> 2u;
+    uint s = (off & 3u) * 8u;
+    return s == 0u ? W[i] : ((W[i] >> s) | (W[i + 1u] << (32u - s)));
+}
+uint bsel(uint w0, uint w1, uint w2, int i) {
+    uint w = i < 4 ? w0 : (i < 8 ? w1 : w2);
+    return (w >> uint(8 * (i & 3))) & 0xFFu;
+}
+const uvec4 SH8 = uvec4(0u, 8u, 16u, 24u);
+vec4 nib_lo(uint q) { return vec4((uvec4(q) >> SH8) & 15u); }
+vec4 nib_hi(uint q) { return vec4((uvec4(q) >> (SH8 + 4u)) & 15u); }
+vec4 q6(uint ql, uint qh, uint lsh, uint hsh) {
+    uvec4 lo = (uvec4(ql) >> (SH8 + lsh)) & 15u;
+    uvec4 hi = (uvec4(qh) >> (SH8 + hsh)) & 3u;
+    return vec4(ivec4(lo | (hi << 4u)) - 32);
+}
+
+void main() {
+    int n0 = grow() * NR;
+    int m = int(gl_WorkGroupID.z);
+    int t = int(gl_LocalInvocationID.x);
+    float acc[NR];
+    for (int r = 0; r < NR; r++) acc[r] = 0.0;
+    int lane = t & 7;
+    int nb = pc.K / 256;
+    int x0 = (pc.xoff + m * pc.K) >> 2;
+    if (pc.qt == 12) {
+        int g = lane >> 1;
+        int l = (lane & 1) * 16;
+        int j0 = 2 * g; int j1 = j0 + 1;
+        for (int b = t >> 3; b < nb; b += WG / 8) {
+            int xa = x0 + ((b * 256 + 64 * g + l) >> 2);
+            vec4 a0 = X4[xa]; vec4 a1 = X4[xa + 1]; vec4 a2 = X4[xa + 2]; vec4 a3 = X4[xa + 3];
+            vec4 c0 = X4[xa + 8]; vec4 c1 = X4[xa + 9]; vec4 c2 = X4[xa + 10]; vec4 c3 = X4[xa + 11];
+            float slo = dot(a0 + a1 + a2 + a3, vec4(1.0));
+            float shi = dot(c0 + c1 + c2 + c3, vec4(1.0));
+            for (int r = 0; r < NR; r++) {
+                int n = n0 + r;
+                if (n >= pc.N) break;
+                uint wb = (uint(n) * uint(nb) + uint(b)) * 36u;
+                vec2 dm = unpackHalf2x16(W[wb]);
+                uint s0 = W[wb + 1u]; uint s1 = W[wb + 2u]; uint s2 = W[wb + 3u];
+                float sc0; float mn0; float sc1; float mn1;
+                if (j0 < 4) {
+                    sc0 = float(bsel(s0, s1, s2, j0) & 63u); mn0 = float(bsel(s0, s1, s2, j0 + 4) & 63u);
+                    sc1 = float(bsel(s0, s1, s2, j1) & 63u); mn1 = float(bsel(s0, s1, s2, j1 + 4) & 63u);
+                } else {
+                    sc0 = float((bsel(s0, s1, s2, j0 + 4) & 15u) | ((bsel(s0, s1, s2, j0 - 4) >> 6u) << 4u));
+                    mn0 = float((bsel(s0, s1, s2, j0 + 4) >> 4u) | ((bsel(s0, s1, s2, j0) >> 6u) << 4u));
+                    sc1 = float((bsel(s0, s1, s2, j1 + 4) & 15u) | ((bsel(s0, s1, s2, j1 - 4) >> 6u) << 4u));
+                    mn1 = float((bsel(s0, s1, s2, j1 + 4) >> 4u) | ((bsel(s0, s1, s2, j1) >> 6u) << 4u));
+                }
+                uint qo = wb + 4u + uint(lane) * 4u;
+                uint q0 = W[qo]; uint q1 = W[qo + 1u]; uint q2 = W[qo + 2u]; uint q3 = W[qo + 3u];
+                float dlo = dot(a0, nib_lo(q0)) + dot(a1, nib_lo(q1)) + dot(a2, nib_lo(q2)) + dot(a3, nib_lo(q3));
+                float dhi = dot(c0, nib_hi(q0)) + dot(c1, nib_hi(q1)) + dot(c2, nib_hi(q2)) + dot(c3, nib_hi(q3));
+                acc[r] += dm.x * (sc0 * dlo + sc1 * dhi) - dm.y * (mn0 * slo + mn1 * shi);
+            }
+        }
+    } else {
+        int half_ = lane >> 2;
+        int l0 = (lane & 3) * 8;
+        int is = l0 / 16;
+        for (int b = t >> 3; b < nb; b += WG / 8) {
+            int xb = x0 + ((b * 256 + 128 * half_ + l0) >> 2);
+            vec4 x1a = X4[xb]; vec4 x1b = X4[xb + 1];
+            vec4 x2a = X4[xb + 8]; vec4 x2b = X4[xb + 9];
+            vec4 x3a = X4[xb + 16]; vec4 x3b = X4[xb + 17];
+            vec4 x4a = X4[xb + 24]; vec4 x4b = X4[xb + 25];
+            for (int r = 0; r < NR; r++) {
+                int n = n0 + r;
+                if (n >= pc.N) break;
+                uint p = (uint(n) * uint(nb) + uint(b)) * 210u;
+                uint qa0 = wword(p + uint(64 * half_ + l0)); uint qa1 = wword(p + uint(64 * half_ + l0 + 4));
+                uint qb0 = wword(p + uint(64 * half_ + 32 + l0)); uint qb1 = wword(p + uint(64 * half_ + 32 + l0 + 4));
+                uint qh0 = wword(p + 128u + uint(32 * half_ + l0)); uint qh1 = wword(p + 128u + uint(32 * half_ + l0 + 4));
+                uint dp = p + 208u;
+                float d = unpackHalf2x16((W[dp >> 2u] >> ((dp & 3u) * 8u)) & 0xFFFFu).x;
+                uint scw0 = wword(p + 192u + uint(8 * half_));
+                uint scw1 = wword(p + 196u + uint(8 * half_));
+                uint sb0 = ((is < 4 ? scw0 : scw1) >> uint(8 * (is & 3))) & 0xFFu;
+                uint sb1 = ((is + 2 < 4 ? scw0 : scw1) >> uint(8 * ((is + 2) & 3))) & 0xFFu;
+                uint sb2 = (scw1 >> uint(8 * ((is + 4) & 3))) & 0xFFu;
+                uint sb3 = (scw1 >> uint(8 * ((is + 6) & 3))) & 0xFFu;
+                vec4 scv = vec4(ivec4(sb0, sb1, sb2, sb3) - ivec4(greaterThanEqual(uvec4(sb0, sb1, sb2, sb3), uvec4(128u))) * 256);
+                float s1 = dot(x1a, q6(qa0, qh0, 0u, 0u)) + dot(x1b, q6(qa1, qh1, 0u, 0u));
+                float s2 = dot(x2a, q6(qb0, qh0, 0u, 2u)) + dot(x2b, q6(qb1, qh1, 0u, 2u));
+                float s3 = dot(x3a, q6(qa0, qh0, 4u, 4u)) + dot(x3b, q6(qa1, qh1, 4u, 4u));
+                float s4 = dot(x4a, q6(qb0, qh0, 4u, 6u)) + dot(x4b, q6(qb1, qh1, 4u, 6u));
+                acc[r] += d * dot(scv, vec4(s1, s2, s3, s4));
+            }
+        }
+    }
+    for (int r = 0; r < NR; r++) {
+        sh[t] = acc[r];
+        barrier();
+        for (int s = WG / 2; s > 0; s >>= 1) {
+            if (t < s) sh[t] += sh[t + s];
+            barrier();
+        }
+        if (t == 0 && n0 + r < pc.N) C[pc.coff + m * pc.N + n0 + r] = sh[0];
+        barrier();
+    }
+}
+"#;
+    s
+}
+
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -531,7 +803,7 @@ pub fn run(
         _ => 14,
     };
     let wg = wg();
-    let tiled_min = env_usize("CANDLE_VULKAN_KQ_TILED_MIN", 16);
+    let tiled_min = env_usize("CANDLE_VULKAN_KQ_TILED_MIN", usize::MAX);
     if m >= tiled_min {
         let gx = n.div_ceil(64);
         let gy = m.div_ceil(64);
@@ -555,7 +827,9 @@ pub fn run(
             [gx as u32, gy as u32, 1],
         );
     }
-    if m > 1 {
+    // m > 1: `mm` (register-tiled multi-token kernel) or `gemv` (GEMV, m on z).
+    let small = std::env::var("CANDLE_VULKAN_KQ_SMALL").unwrap_or_else(|_| "gemv".into());
+    if m > 1 && small != "gemv" {
         let nr = env_usize("CANDLE_VULKAN_KQ_MM_NR", 2);
         let mt = env_usize("CANDLE_VULKAN_KQ_MM_MT", 8);
         let lim = d.limits();
@@ -579,7 +853,27 @@ pub fn run(
     let gx = groups.min(lim.max_groups_x as usize).max(1);
     let gy = groups.div_ceil(gx);
     let push = Push::default().us(n)?.us(k)?.us(xoff)?.i(0).us(m)?.i(qt);
-    let key = format!("kq_gemv_{wg}_{nr}");
+    if xoff % 4 == 0 && std::env::var("CANDLE_VULKAN_KQ_VEC").map_or(true, |v| v == "8") {
+        return d.launch(
+            &format!("kq_gemv_v8_{wg}_{nr}"),
+            |_| source_v8(wg, nr),
+            &[x, w, out],
+            push,
+            &[],
+            [gx as u32, gy as u32, m as u32],
+        );
+    }
+    if xoff % 4 == 0 && std::env::var("CANDLE_VULKAN_KQ_VEC").map_or(true, |v| v != "0") {
+        return d.launch(
+            &format!("kq_gemv_v4_{wg}_{nr}"),
+            |_| source_v4(wg, nr),
+            &[x, w, out],
+            push,
+            &[],
+            [gx as u32, gy as u32, m as u32],
+        );
+    }
+    let key = format!("kq_gemv_{wg}_{nr}_{}", subgroup());
     d.launch(
         &key,
         |_| source(wg, nr),

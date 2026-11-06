@@ -657,6 +657,10 @@ fn init_vulkan(gpu_id: usize, qgemv: Option<kernels::Qgemv>) -> Result<VulkanDev
         },
     };
     let lim = &props.limits;
+    kernels::TS_PERIOD_BITS.store(
+        lim.timestamp_period.to_bits(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let max_inv = lim.max_compute_work_group_invocations.max(64) as usize;
     let mut wg = 1usize;
     while wg * 2 <= max_inv.min(256) {
@@ -876,6 +880,16 @@ impl VulkanDevice {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let mut exec = self.exec();
+        if exec.recording && std::env::var_os("CANDLE_VULKAN_TRACE_SYNC").is_some() {
+            let bt = std::backtrace::Backtrace::force_capture().to_string();
+            let frames: Vec<&str> = bt
+                .lines()
+                .filter(|l| l.contains("mistralrs") && !l.trim_start().starts_with("at "))
+                .take(3)
+                .map(|l| l.trim())
+                .collect();
+            eprintln!("[vulkan-sync] {}", frames.join(" <- "));
+        }
         let mut garbage = exec.flush()?;
         exec.batch_limit = kernels::MAX_LAUNCHES;
         drop(exec);
@@ -2450,7 +2464,12 @@ impl QVulkanStorage {
             return Ok((out, dst_shape));
         }
         if kq::supports(self.dtype, k)
-            && (m <= QGEMV_MAX_ROWS || std::env::var("CANDLE_VULKAN_KQ_MM").is_ok_and(|v| v == "1"))
+            && (m
+                <= std::env::var("CANDLE_VULKAN_KQ_MAXM")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(QGEMV_MAX_ROWS)
+                || std::env::var("CANDLE_VULKAN_KQ_MM").is_ok_and(|v| v == "1"))
         {
             kq::run(dev, self.dtype, storage.buf(), w, out.buf(), m, n, k, o1)?;
             return Ok((out, dst_shape));

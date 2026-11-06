@@ -77,7 +77,12 @@ fn main() -> Result<()> {
         }
     }
 
-    for m in [1usize, 64] {
+    let pms: Vec<usize> = std::env::var("PM")
+        .unwrap_or_else(|_| "64".into())
+        .split(',')
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    for m in std::iter::once(1usize).chain(pms) {
         let mut xs = HashMap::new();
         for (_, _, k, _) in &mats {
             xs.entry(*k)
@@ -140,6 +145,58 @@ fn main() -> Result<()> {
         }
     }
 
+    // raw read bandwidth roof: each invocation sums uvec4s with a grid stride
+    {
+        use candle_core::backend::BackendStorage;
+        use candle_core::vulkan_backend::{glsl, kernels};
+        let words = 128usize << 20; // 512 MiB of u32
+        let big = Tensor::zeros(words, candle_core::DType::U32, &dev)?;
+        let out = Tensor::zeros(1 << 20, candle_core::DType::U32, &dev)?;
+        let vk = dev.as_vulkan_device()?;
+        let (bs, _) = big.storage_and_layout();
+        let (os, _) = out.storage_and_layout();
+        let (candle_core::Storage::Vulkan(bs), candle_core::Storage::Vulkan(os)) = (&*bs, &*os)
+        else {
+            unreachable!()
+        };
+        for wg in [64usize, 256] {
+            let groups = (1usize << 20) / wg;
+            let src = move |_| {
+                let mut s = glsl::prelude(wg, 2);
+                s += "layout(std430, set=0, binding=0) readonly buffer B0 { uvec4 A[]; };\n\
+                      layout(std430, set=0, binding=1) buffer B1 { uint O[]; };\n\
+                      layout(push_constant) uniform PC { int n4; } pc;\n\
+                      layout(local_size_x = WG) in;\n\
+                      void main() { int i = gid(); int stride = int(gl_NumWorkGroups.x) * WG; uvec4 acc = uvec4(0u);\n\
+                      for (int j = i; j < pc.n4; j += stride) acc ^= A[j];\n\
+                      O[i] = acc.x ^ acc.y ^ acc.z ^ acc.w; }\n";
+                s
+            };
+            let launch = || {
+                vk.launch(
+                    &format!("probe_bw_{wg}"),
+                    src,
+                    &[bs.buf(), os.buf()],
+                    kernels::Push::default().us(words / 4).unwrap(),
+                    &[],
+                    [groups as u32, 1, 1],
+                )
+            };
+            launch()?;
+            dev.synchronize()?;
+            let t0 = Instant::now();
+            for _ in 0..20 {
+                launch()?;
+            }
+            dev.synchronize()?;
+            let dt = t0.elapsed().as_secs_f64() / 20.0;
+            println!(
+                "bandwidth roof (wg {wg}): {:6.1} GB/s",
+                (words * 4) as f64 / dt / 1e9
+            );
+        }
+    }
+
     // dispatch overhead: dependent tiny ops
     let n_ops = 2000;
     let mut a = Tensor::zeros(2048, candle_core::DType::F32, &dev)?;
@@ -149,8 +206,13 @@ fn main() -> Result<()> {
     for _ in 0..n_ops {
         a = (a + &b)?;
     }
+    let rec = t0.elapsed().as_secs_f64();
     dev.synchronize()?;
     let dt = t0.elapsed().as_secs_f64();
+    println!(
+        "host recording {:5.1} us/op (alloc + descriptors + record)",
+        rec / n_ops as f64 * 1e6
+    );
     println!(
         "overhead {:7.1} us/dispatch (tiny dependent add, {n_ops} ops)",
         dt / n_ops as f64 * 1e6

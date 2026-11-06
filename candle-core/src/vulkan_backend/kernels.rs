@@ -118,6 +118,20 @@ impl std::fmt::Display for VulkanStats {
             self.gpu_wait_ns as f64 / 1e6,
             self.dequantizations,
         )?;
+        let prof = kernel_profile();
+        if !prof.is_empty() {
+            let total: u64 = prof.iter().map(|p| p.2).sum();
+            write!(f, "\n  GPU kernel time {:.1} ms:", total as f64 / 1e6)?;
+            for (k, c, ns) in prof.iter().take(15) {
+                write!(
+                    f,
+                    "\n    {:6.1}% {:9.2} ms {:7} x  {k}",
+                    *ns as f64 * 100.0 / total.max(1) as f64,
+                    *ns as f64 / 1e6,
+                    c
+                )?;
+            }
+        }
         if !self.cpu_fallbacks_by_op.is_empty() {
             let ops: Vec<String> = self
                 .cpu_fallbacks_by_op
@@ -128,6 +142,36 @@ impl std::fmt::Display for VulkanStats {
         }
         Ok(())
     }
+}
+
+// ─── GPU kernel profiler (CANDLE_VULKAN_PROFILE=1) ─────────────────────────────
+
+pub(crate) static TS_PERIOD_BITS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+static PROFILE: std::sync::Mutex<Option<HashMap<String, (u64, u64)>>> = std::sync::Mutex::new(None);
+const PROF_CAP: u32 = (MAX_LAUNCHES as u32) + 2;
+
+pub fn profile_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANDLE_VULKAN_PROFILE").is_ok_and(|v| v == "1"))
+}
+
+/// Per-kernel GPU time `(key, dispatches, total ns)`, most expensive first.
+/// Filled only with `CANDLE_VULKAN_PROFILE=1` (timestamps around every dispatch).
+pub fn kernel_profile() -> Vec<(String, u64, u64)> {
+    let mut v: Vec<_> = PROFILE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .map(|m| m.iter().map(|(k, (c, ns))| (k.clone(), *c, *ns)).collect())
+        .unwrap_or_default();
+    v.sort_by(|a, b| b.2.cmp(&a.2));
+    v
+}
+
+struct Profiler {
+    pool: vk::QueryPool,
+    keys: Vec<String>,
 }
 
 /// The current process-wide Vulkan counters.
@@ -164,6 +208,7 @@ pub fn reset_stats() {
     WAIT_NS.store(0, Relaxed);
     DEQUANTIZE.store(0, Relaxed);
     *FALLBACK_OPS.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    *PROFILE.lock().unwrap_or_else(|p| p.into_inner()) = None;
 }
 
 /// Record (and, under `CANDLE_VULKAN_TRACE`, log) an op that fell back to
@@ -291,6 +336,70 @@ pub struct Pipe {
     pub layout: vk::PipelineLayout,
     pub dsl: vk::DescriptorSetLayout,
     pub nbuf: u32,
+    /// Per binding (set 0): whether the shader may write it (no `NonWritable`).
+    pub writable: Vec<bool>,
+}
+
+/// Which set-0 bindings of a SPIR-V module are writable: a storage buffer is
+/// read-only when its variable or its block member carries `NonWritable`.
+fn spirv_writable_bindings(spirv: &[u32], n: usize) -> Vec<bool> {
+    use std::collections::{HashMap, HashSet};
+    let mut binding: HashMap<u32, u32> = HashMap::new();
+    let mut nonwritable: HashSet<u32> = HashSet::new();
+    let mut nonwritable_struct: HashSet<u32> = HashSet::new();
+    let mut ptr_pointee: HashMap<u32, u32> = HashMap::new();
+    let mut var_type: HashMap<u32, u32> = HashMap::new();
+    let mut i = 5;
+    while i < spirv.len() {
+        let word = spirv[i];
+        let (len, op) = ((word >> 16) as usize, word & 0xFFFF);
+        if len == 0 || i + len > spirv.len() {
+            break;
+        }
+        let a = &spirv[i + 1..i + len];
+        match op {
+            71 if a.len() >= 2 => match a[1] {
+                33 if a.len() >= 3 => {
+                    binding.insert(a[0], a[2]);
+                }
+                24 => {
+                    nonwritable.insert(a[0]);
+                }
+                _ => {}
+            },
+            72 if a.len() >= 3 && a[2] == 24 => {
+                nonwritable_struct.insert(a[0]);
+            }
+            32 if a.len() >= 3 => {
+                ptr_pointee.insert(a[0], a[2]);
+            }
+            59 if a.len() >= 2 => {
+                var_type.insert(a[1], a[0]);
+            }
+            _ => {}
+        }
+        i += len;
+    }
+    let mut out = vec![true; n];
+    for (var, b) in binding {
+        let b = b as usize;
+        if b >= n {
+            continue;
+        }
+        let ro = nonwritable.contains(&var)
+            || var_type
+                .get(&var)
+                .and_then(|ptr| ptr_pointee.get(ptr))
+                .is_some_and(|st| nonwritable_struct.contains(st));
+        out[b] = !ro;
+    }
+    out
+}
+
+/// `CANDLE_VULKAN_BARRIERS=full` restores a barrier after every dispatch.
+fn tracked_barriers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANDLE_VULKAN_BARRIERS").map_or(true, |v| v != "full"))
 }
 
 /// Naga 27 lowers GLSL `barrier()` to `Barrier::all()`, which includes
@@ -505,6 +614,7 @@ pub(super) fn create_pipe(
         layout: layouts.layout,
         dsl: layouts.dsl,
         nbuf,
+        writable: spirv_writable_bindings(spirv, nbuf as usize + 1),
     })
 }
 
@@ -551,9 +661,35 @@ pub struct Exec {
     launches: usize,
     pub(super) batch_limit: usize,
     pub(super) garbage: Vec<Garbage>,
+    prof: Option<Profiler>,
+    pub(super) prof_key: String,
+    cmd_pool_handle: vk::CommandPool,
+    /// Submitted, not yet waited segments `(cmd, fence)` and reusable spares.
+    inflight: Vec<(vk::CommandBuffer, vk::Fence)>,
+    spare: Vec<(vk::CommandBuffer, vk::Fence)>,
+    seg_launches: usize,
+    /// Buffers written / read since the last barrier (tracked mode).
+    written: std::collections::HashSet<vk::Buffer>,
+    read: std::collections::HashSet<vk::Buffer>,
 }
 
 unsafe impl Send for Exec {}
+
+/// Launches per early-submitted segment (`CANDLE_VULKAN_SEGMENT`, 0 = one
+/// submission per batch). Early segments let the GPU start while the host
+/// keeps recording the rest of the step.
+fn segment_launches() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CANDLE_VULKAN_SEGMENT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32)
+    })
+}
+
+/// Segments in flight before recording continues in the current one.
+const MAX_SEGMENTS: usize = 64;
 
 impl Exec {
     pub(super) fn new(
@@ -643,6 +779,14 @@ impl Exec {
             recording: false,
             launches: 0,
             batch_limit: MAX_LAUNCHES,
+            prof: None,
+            prof_key: String::new(),
+            cmd_pool_handle: cmd_pool,
+            inflight: Vec::new(),
+            spare: Vec::new(),
+            seg_launches: 0,
+            written: std::collections::HashSet::new(),
+            read: std::collections::HashSet::new(),
             garbage: Vec::new(),
         })
     }
@@ -665,7 +809,39 @@ impl Exec {
         }
         self.recording = true;
         self.launches = 0;
+        self.seg_launches = 0;
+        self.written.clear();
+        self.read.clear();
         self.params_off = 0;
+        if profile_enabled() {
+            if self.prof.is_none() {
+                let pool = unsafe {
+                    self.device.create_query_pool(
+                        &vk::QueryPoolCreateInfo::default()
+                            .query_type(vk::QueryType::TIMESTAMP)
+                            .query_count(PROF_CAP),
+                        None,
+                    )
+                }
+                .map_err(|e| Error::Msg(format!("vulkan create_query_pool failed: {e:?}")))?;
+                self.prof = Some(Profiler {
+                    pool,
+                    keys: Vec::new(),
+                });
+            }
+            let prof = self.prof.as_mut().unwrap();
+            prof.keys.clear();
+            unsafe {
+                self.device
+                    .cmd_reset_query_pool(self.cmd, prof.pool, 0, PROF_CAP);
+                self.device.cmd_write_timestamp(
+                    self.cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    prof.pool,
+                    0,
+                );
+            }
+        }
         Ok(())
     }
 
@@ -698,13 +874,44 @@ impl Exec {
                 self.device
                     .queue_submit(self.queue, &submit, self.fence)
                     .map_err(|e| Error::Msg(format!("vulkan queue_submit failed: {e:?}")))?;
+                let mut fences: Vec<vk::Fence> = self.inflight.iter().map(|p| p.1).collect();
+                fences.push(self.fence);
                 self.device
-                    .wait_for_fences(&[self.fence], true, u64::MAX)
+                    .wait_for_fences(&fences, true, u64::MAX)
                     .map_err(|e| Error::Msg(format!("vulkan wait_for_fences failed: {e:?}")))?;
                 note_submit(t0.elapsed());
+                if let Some(prof) = self.prof.as_mut() {
+                    let n = prof.keys.len();
+                    if n > 0 {
+                        let mut ts = vec![0u64; n + 1];
+                        if self
+                            .device
+                            .get_query_pool_results(
+                                prof.pool,
+                                0,
+                                &mut ts,
+                                vk::QueryResultFlags::TYPE_64,
+                            )
+                            .is_ok()
+                        {
+                            let period = f32::from_bits(
+                                TS_PERIOD_BITS.load(std::sync::atomic::Ordering::Relaxed),
+                            ) as f64;
+                            let mut map = PROFILE.lock().unwrap_or_else(|p| p.into_inner());
+                            let map = map.get_or_insert_with(HashMap::new);
+                            for (i, key) in prof.keys.iter().enumerate() {
+                                let dt = ts[i + 1].saturating_sub(ts[i]) as f64 * period;
+                                let e = map.entry(key.clone()).or_insert((0, 0));
+                                e.0 += 1;
+                                e.1 += dt as u64;
+                            }
+                        }
+                    }
+                }
                 self.device
-                    .reset_fences(&[self.fence])
+                    .reset_fences(&fences)
                     .map_err(|e| Error::Msg(format!("vulkan reset_fences failed: {e:?}")))?;
+                self.spare.append(&mut self.inflight);
                 self.device
                     .reset_descriptor_pool(self.desc_pool, vk::DescriptorPoolResetFlags::empty())
                     .map_err(|e| {
@@ -716,6 +923,57 @@ impl Exec {
     }
 
     /// Record one dispatch.  `params` is written to the ring and bound last.
+    /// Submits the commands recorded so far without waiting, and continues
+    /// recording in a fresh command buffer.
+    fn submit_segment(&mut self) -> Result<()> {
+        unsafe {
+            self.device
+                .end_command_buffer(self.cmd)
+                .map_err(|e| Error::Msg(format!("vulkan end_command_buffer failed: {e:?}")))?;
+            let cmds = [self.cmd];
+            let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
+            self.device
+                .queue_submit(self.queue, &submit, self.fence)
+                .map_err(|e| Error::Msg(format!("vulkan queue_submit failed: {e:?}")))?;
+            self.inflight.push((self.cmd, self.fence));
+            let (cmd, fence) = match self.spare.pop() {
+                Some(pair) => pair,
+                None => {
+                    let cmd = self
+                        .device
+                        .allocate_command_buffers(
+                            &vk::CommandBufferAllocateInfo::default()
+                                .command_pool(self.cmd_pool_handle)
+                                .level(vk::CommandBufferLevel::PRIMARY)
+                                .command_buffer_count(1),
+                        )
+                        .map_err(|e| {
+                            Error::Msg(format!("vulkan allocate_command_buffers failed: {e:?}"))
+                        })?[0];
+                    let fence = self
+                        .device
+                        .create_fence(&vk::FenceCreateInfo::default(), None)
+                        .map_err(|e| Error::Msg(format!("vulkan create_fence failed: {e:?}")))?;
+                    (cmd, fence)
+                }
+            };
+            self.cmd = cmd;
+            self.fence = fence;
+            self.device
+                .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
+                .map_err(|e| Error::Msg(format!("vulkan reset_command_buffer failed: {e:?}")))?;
+            self.device
+                .begin_command_buffer(
+                    self.cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .map_err(|e| Error::Msg(format!("vulkan begin_command_buffer failed: {e:?}")))?;
+        }
+        self.seg_launches = 0;
+        Ok(())
+    }
+
     fn record(
         &mut self,
         pipe: &Pipe,
@@ -783,19 +1041,65 @@ impl Exec {
             let mut pc = [0u8; PUSH_BYTES as usize];
             pc[..push.len()].copy_from_slice(push);
             dev.cmd_push_constants(self.cmd, pipe.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
-            dev.cmd_dispatch(self.cmd, groups[0], groups[1], groups[2]);
             let barrier = [vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
-            dev.cmd_pipeline_barrier(
-                self.cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &barrier,
-                &[],
-                &[],
-            );
+            if tracked_barriers() {
+                // Barrier only on a hazard with dispatches since the last barrier.
+                let hazard = bufs.iter().enumerate().any(|(i, b)| {
+                    let w = pipe.writable.get(i).copied().unwrap_or(true);
+                    self.written.contains(&b.buffer) || (w && self.read.contains(&b.buffer))
+                });
+                if hazard {
+                    dev.cmd_pipeline_barrier(
+                        self.cmd,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &barrier,
+                        &[],
+                        &[],
+                    );
+                    self.written.clear();
+                    self.read.clear();
+                }
+                for (i, b) in bufs.iter().enumerate() {
+                    if pipe.writable.get(i).copied().unwrap_or(true) {
+                        self.written.insert(b.buffer);
+                    } else {
+                        self.read.insert(b.buffer);
+                    }
+                }
+            }
+            dev.cmd_dispatch(self.cmd, groups[0], groups[1], groups[2]);
+            if !tracked_barriers() {
+                dev.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &barrier,
+                    &[],
+                    &[],
+                );
+            }
+            if let Some(prof) = self.prof.as_mut() {
+                let i = prof.keys.len() as u32 + 1;
+                if i < PROF_CAP {
+                    dev.cmd_write_timestamp(
+                        self.cmd,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        prof.pool,
+                        i,
+                    );
+                    prof.keys.push(std::mem::take(&mut self.prof_key));
+                }
+            }
+        }
+        self.seg_launches += 1;
+        let seg = segment_launches();
+        if seg > 0 && self.seg_launches >= seg && self.inflight.len() < MAX_SEGMENTS {
+            self.submit_segment()?;
         }
         self.launches += 1;
         note_native_exec();
@@ -887,6 +1191,9 @@ impl Drop for Exec {
             self.device.free_memory(self.params_mem, None);
             self.device.destroy_descriptor_pool(self.desc_pool, None);
             self.device.destroy_fence(self.fence, None);
+            for (_, f) in self.inflight.iter().chain(self.spare.iter()) {
+                self.device.destroy_fence(*f, None);
+            }
             self.device.destroy_command_pool(self.cmd_pool, None);
         }
     }
@@ -1004,6 +1311,9 @@ impl VulkanDevice {
         let nbuf = bufs.len() as u32;
         let pipe = self.pipeline(key, nbuf, src)?;
         let mut exec = self.exec();
+        if profile_enabled() {
+            exec.prof_key = key.to_string();
+        }
         let full = exec.record(&pipe, bufs, &push.0, params, groups)?;
         if full {
             let garbage = exec.flush()?;
@@ -2293,6 +2603,9 @@ pub fn run_qgemv(
     k: usize,
     xoff: usize,
 ) -> Result<()> {
+    if m == 1 && super::kq::supports(dtype, k) {
+        return super::kq::run(d, dtype, x, w, out, m, n, k, xoff);
+    }
     run_qgemv_with(d, d.limits().qgemv, dtype, x, w, out, m, n, k, xoff)
 }
 
@@ -2310,9 +2623,6 @@ pub fn run_qgemv_with(
     k: usize,
     xoff: usize,
 ) -> Result<()> {
-    if super::kq::supports(dtype, k) {
-        return super::kq::run(d, dtype, x, w, out, m, n, k, xoff);
-    }
     let lim = d.limits();
     let cubecl = match dtype {
         crate::quantized::GgmlDType::Q4K => Some((
